@@ -7,6 +7,9 @@ import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
+import os
+import argparse
+from collections import deque
 
 # ----------------------------
 # Config
@@ -14,20 +17,15 @@ import pycuda.autoinit
 DISPLAY_W, DISPLAY_H = 1280, 800  # your screen resolution
 CAPTURE_W, CAPTURE_H = 1280, 800  # capture size (lower = less latency)
 CAPTURE_FPS = 60
-ENGINE_PATH = "mobilenetv3_480_fp16.engine"
+ENGINE_PATH = "binary_480_fp16.engine"
 MODEL_W, MODEL_H = 480, 480
+CROP_SIZE = 960
 PROB_THRESHOLD = 0.9
-NUM_CLASSES = 9
+NUM_CLASSES = 2
+DUMP_INTERVAL_SEC = 5.0
 CLASS_NAMES = [
-    "black_stain",
-    "corrosion",
-    "crack",
-    "deformation",
-    "missing_part",
-    "no_defects",
-    "other",
-    "silicate_stain",
-    "water_stain",
+    "defect",
+    "ok"
 ]
 
 from smbus2 import SMBus, i2c_msg
@@ -150,14 +148,36 @@ class TensorRTClassifier:
 
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        self.last_crop_bgr: np.ndarray | None = None
+        self.last_logits: np.ndarray | None = None
+        self.last_probs: np.ndarray | None = None
 
-    def preprocess(self, frame: np.ndarray) -> np.ndarray:
-        resized = cv2.resize(frame, (self.model_w, self.model_h), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    def preprocess(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        h, w = frame.shape[:2]
+        is_bgra = frame.ndim == 3 and frame.shape[2] == 4
+        scale = float(CROP_SIZE) / float(min(h, w))
+        new_w = int(round(w * scale))
+        new_h = int(round(h * scale))
+        y0 = (new_h - CROP_SIZE) // 2
+        x0 = (new_w - CROP_SIZE) // 2
+
+        gpu = cv2.cuda_GpuMat()
+        gpu.upload(frame)
+        if is_bgra:
+            gpu = cv2.cuda.cvtColor(gpu, cv2.COLOR_BGRA2BGR)
+        gpu_resized = cv2.cuda.resize(gpu, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        gpu_crop = gpu_resized.rowRange(y0, y0 + CROP_SIZE).colRange(x0, x0 + CROP_SIZE)
+        gpu_model = cv2.cuda.resize(
+            gpu_crop, (self.model_w, self.model_h), interpolation=cv2.INTER_LINEAR
+        )
+        gpu_rgb = cv2.cuda.cvtColor(gpu_model, cv2.COLOR_BGR2RGB)
+        cropped = gpu_model.download()
+        rgb = gpu_rgb.download()
+       
         input_data = rgb.astype(np.float32) / 255.0
         input_data = (input_data - self.mean) / self.std
         chw = np.transpose(input_data, (2, 0, 1))
-        return chw
+        return chw, cropped
 
     def _select_output_name(self, output_names: list[str]) -> str:
         for name in output_names:
@@ -190,7 +210,8 @@ class TensorRTClassifier:
         return exp / np.sum(exp)
 
     def infer(self, frame: np.ndarray) -> tuple[int, float]:
-        chw = self.preprocess(frame)
+        chw, crop_bgr = self.preprocess(frame)
+        self.last_crop_bgr = crop_bgr
         if self.input_dtype == np.float16:
             chw = chw.astype(np.float16)
         np.copyto(self.host_in, chw.ravel())
@@ -206,29 +227,48 @@ class TensorRTClassifier:
         self.stream.synchronize()
 
         output = self.host_out.reshape(self.output_shape)
+        logits = output.reshape(-1).astype(np.float32)
         probs = self._to_probs(output)
+        self.last_logits = logits
+        self.last_probs = probs
         top1 = int(np.argmax(probs))
         prob = float(probs[top1])
         return top1, prob
 
+
+
 # ----------------------------
 # Camera pipeline
 # ----------------------------
-def gstreamer_pipeline() -> str:
+def gstreamer_pipeline(
+        sensor_id: int = 0,
+        sensor_mode: int = 1,
+        capture_width: int = 2464,
+        capture_height: int = 2064,
+        flip_method: int = 2,
+        framerate: int = 60
+) -> str:
     return (
-        "nvarguscamerasrc sensor-id=0 ! "
-        f"video/x-raw(memory:NVMM), width={CAPTURE_W}, height={CAPTURE_H}, "
-        f"framerate={CAPTURE_FPS}/1, format=NV12 ! "
-        "nvvidconv flip-method=2 ! "
-        "video/x-raw, format=BGRx ! "
-        "queue max-size-buffers=1 leaky=downstream ! "
-        "appsink drop=1 max-buffers=1 sync=false"
+        f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} aelock=true awblock=false wbmode=2 tnr-mode=0 tnr-strength=-1 ee-mode=2 ee-strength=0 saturation=0.75 gainrange=\"1 1\" ispdigitalgainrange=\"1 1\" "
+        f"! video/x-raw(memory:NVMM), width={capture_width}, height={capture_height}, framerate={framerate}/1, format=NV12 "
+        f"! nvvidconv flip-method={flip_method} "
+        "! video/x-raw, format=BGRx "
+        "! queue max-size-buffers=1 leaky=downstream "
+        "! appsink drop=1 max-buffers=1 sync=false"
     )
 
 # ----------------------------
 # Main
 # ----------------------------
 def main():
+    parser = argparse.ArgumentParser(description="Camera stream with TensorRT inference")
+    parser.add_argument(
+        "--debug-crops",
+        action="store_true",
+        help="Enable periodic debug crop dumps and output logging",
+    )
+    args = parser.parse_args()
+
     # Check OpenCV CUDA support
     print(f"OpenCV version: {cv2.__version__}")
     print(f"CUDA enabled: {cv2.cuda.getCudaEnabledDeviceCount() > 0}")
@@ -245,7 +285,7 @@ def main():
     time.sleep(delay)
     
     cap = None
-    pipeline = gstreamer_pipeline()
+    pipeline = gstreamer_pipeline(capture_width=CAPTURE_W, capture_height=CAPTURE_H, framerate=CAPTURE_FPS)
     try:
         candidate = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         if candidate.isOpened():
@@ -257,7 +297,6 @@ def main():
     if cap is None or not cap.isOpened():
         raise RuntimeError("Failed to open camera with CSI GStreamer pipelines")
 
-    # Setup window
     window_name = "Camera Stream"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H)
@@ -265,10 +304,16 @@ def main():
     # FPS tracking
     fps = 0.0
     t_prev = time.time()
+    frame_idx = 0
+    last_dump_time = 0.0
+    infer_times = deque(maxlen=30)
 
     classifier = TensorRTClassifier(ENGINE_PATH, MODEL_W, MODEL_H, NUM_CLASSES)
 
-    print("Press ESC to exit\n")
+    if args.debug_crops and DUMP_INTERVAL_SEC > 0:
+        print(f"Press ESC to exit. Auto dump every {DUMP_INTERVAL_SEC:.0f} seconds.\n")
+    else:
+        print("Press ESC to exit.\n")
 
     try:
         while True:
@@ -276,6 +321,9 @@ def main():
             if not ok:
                 print("Failed to read frame")
                 break
+            frame_idx += 1
+            if frame_idx % 2 == 0:
+                continue
 
             # Calculate FPS
             now = time.time()
@@ -283,6 +331,7 @@ def main():
             if dt > 0:
                 fps = 0.9 * fps + 0.1 * (1.0 / dt)
             t_prev = now
+
 
             # Draw FPS counter
             cv2.putText(
@@ -296,7 +345,11 @@ def main():
                 cv2.LINE_AA,
             )
 
+
+            infer_start = time.time()
             class_id, prob = classifier.infer(frame)
+            infer_times.append(time.time() - infer_start)
+            mean_infer_ms = (sum(infer_times) / len(infer_times)) * 1000.0
             if prob >= PROB_THRESHOLD:
                 label = CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else str(class_id)
                 cv2.putText(
@@ -310,11 +363,34 @@ def main():
                     cv2.LINE_AA,
                 )
 
-            # Display
+            cv2.putText(
+                frame,
+                f"Infer: {mean_infer_ms:.1f} ms (avg 30)",
+                (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
             cv2.imshow(window_name, frame)
 
+            if args.debug_crops and DUMP_INTERVAL_SEC > 0 and (now - last_dump_time) >= DUMP_INTERVAL_SEC:
+                if classifier.last_crop_bgr is not None:
+                    os.makedirs("debug_crops", exist_ok=True)
+                    stamp = time.strftime("%Y%m%d_%H%M%S")
+                    out_path = os.path.join("debug_crops", f"crop_{stamp}.jpg")
+                    cv2.imwrite(out_path, classifier.last_crop_bgr)
+                    print(f"Saved crop: {out_path}")
+                if classifier.last_logits is not None and classifier.last_probs is not None:
+                    print("Logits:", np.round(classifier.last_logits, 4))
+                    print("Probs:", np.round(classifier.last_probs, 4))
+                last_dump_time = now
+
+            key = cv2.waitKey(1) & 0xFF
             # Exit on ESC
-            if (cv2.waitKey(1) & 0xFF) == 27:
+            if key == 27:
                 break
 
     finally:
