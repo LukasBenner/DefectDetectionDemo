@@ -17,16 +17,29 @@ from collections import deque
 DISPLAY_W, DISPLAY_H = 1280, 800  # your screen resolution
 CAPTURE_W, CAPTURE_H = 1280, 800  # capture size (lower = less latency)
 CAPTURE_FPS = 60
-ENGINE_PATH = "binary_480_fp16.engine"
+ENGINE_PATH = "simple_480_fp16.engine"
 MODEL_W, MODEL_H = 480, 480
 CROP_SIZE = 960
 PROB_THRESHOLD = 0.9
-NUM_CLASSES = 2
+NUM_CLASSES = 9
 DUMP_INTERVAL_SEC = 5.0
 CLASS_NAMES = [
-    "defect",
-    "ok"
+    "background",
+    "ok",
+    "defect"
 ]
+
+# CLASS_NAMES = [
+#     "black_stain",
+#     "corrosion",
+#     "crack",
+#     "deformation",
+#     "missing_part",
+#     "ok",
+#     "other",
+#     "silicate_stain",
+#     "water_stain"
+# ]
 
 from smbus2 import SMBus, i2c_msg
 import time
@@ -209,13 +222,14 @@ class TensorRTClassifier:
         exp = np.exp(logits)
         return exp / np.sum(exp)
 
-    def infer(self, frame: np.ndarray) -> tuple[int, float]:
+    def infer(self, frame: np.ndarray) -> tuple[int, float, float]:
         chw, crop_bgr = self.preprocess(frame)
         self.last_crop_bgr = crop_bgr
         if self.input_dtype == np.float16:
             chw = chw.astype(np.float16)
         np.copyto(self.host_in, chw.ravel())
 
+        infer_start = time.perf_counter()
         cuda.memcpy_htod_async(self.device_in, self.host_in, self.stream)
         if self.use_io_tensors:
             self.context.set_tensor_address(self.input_name, int(self.device_in))
@@ -225,6 +239,7 @@ class TensorRTClassifier:
             self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
         cuda.memcpy_dtoh_async(self.host_out, self.device_out, self.stream)
         self.stream.synchronize()
+        infer_ms = (time.perf_counter() - infer_start) * 1000.0
 
         output = self.host_out.reshape(self.output_shape)
         logits = output.reshape(-1).astype(np.float32)
@@ -233,7 +248,7 @@ class TensorRTClassifier:
         self.last_probs = probs
         top1 = int(np.argmax(probs))
         prob = float(probs[top1])
-        return top1, prob
+        return top1, prob, infer_ms
 
 
 
@@ -305,8 +320,11 @@ def main():
     fps = 0.0
     t_prev = time.time()
     frame_idx = 0
+    lighting_idx = 0
     last_dump_time = 0.0
     infer_times = deque(maxlen=30)
+    last_class_id: int | None = None
+    last_prob: float | None = None
 
     classifier = TensorRTClassifier(ENGINE_PATH, MODEL_W, MODEL_H, NUM_CLASSES)
 
@@ -324,6 +342,7 @@ def main():
             frame_idx += 1
             if frame_idx % 2 == 0:
                 continue
+            lighting_idx += 1
 
             # Calculate FPS
             now = time.time()
@@ -346,33 +365,42 @@ def main():
             )
 
 
-            infer_start = time.time()
-            class_id, prob = classifier.infer(frame)
-            infer_times.append(time.time() - infer_start)
-            mean_infer_ms = (sum(infer_times) / len(infer_times)) * 1000.0
-            if prob >= PROB_THRESHOLD:
-                label = CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else str(class_id)
+            if lighting_idx % 2 == 1:
+                class_id, prob, infer_ms = classifier.infer(frame)
+                infer_times.append(infer_ms)
+                last_class_id = class_id
+                last_prob = prob
+
+            if infer_times:
+                mean_infer_ms = sum(infer_times) / len(infer_times)
                 cv2.putText(
                     frame,
-                    f"{label}: {prob:.2f}",
-                    (20, 100),
+                    f"Infer: {mean_infer_ms:.1f} ms (avg 30)",
+                    (20, 140),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
+                    1.0,
                     (0, 255, 255),
-                    3,
+                    2,
                     cv2.LINE_AA,
                 )
 
-            cv2.putText(
-                frame,
-                f"Infer: {mean_infer_ms:.1f} ms (avg 30)",
-                (20, 140),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            if last_class_id is not None and last_prob is not None:
+                if last_prob >= PROB_THRESHOLD:
+                    label = (
+                        CLASS_NAMES[last_class_id]
+                        if last_class_id < len(CLASS_NAMES)
+                        else str(last_class_id)
+                    )
+                    cv2.putText(
+                        frame,
+                        f"{label}: {last_prob:.2f}",
+                        (20, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2,
+                        (0, 255, 255),
+                        3,
+                        cv2.LINE_AA,
+                    )
 
             cv2.imshow(window_name, frame)
 
