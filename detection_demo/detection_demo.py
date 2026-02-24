@@ -17,29 +17,29 @@ from collections import deque
 DISPLAY_W, DISPLAY_H = 1280, 800  # your screen resolution
 CAPTURE_W, CAPTURE_H = 1280, 800  # capture size (lower = less latency)
 CAPTURE_FPS = 60
-ENGINE_PATH = "simple_480_fp16.engine"
+ENGINE_PATH = "mobilenet_l_480_fp16.engine"
 MODEL_W, MODEL_H = 480, 480
 CROP_SIZE = 960
-PROB_THRESHOLD = 0.9
+PROB_THRESHOLD = 0.85
 NUM_CLASSES = 9
 DUMP_INTERVAL_SEC = 5.0
-CLASS_NAMES = [
-    "background",
-    "ok",
-    "defect"
-]
-
 # CLASS_NAMES = [
-#     "black_stain",
-#     "corrosion",
-#     "crack",
-#     "deformation",
-#     "missing_part",
+#     "background",
 #     "ok",
-#     "other",
-#     "silicate_stain",
-#     "water_stain"
+#     "defect"
 # ]
+
+CLASS_NAMES = [
+    "black_stain",
+    "corrosion",
+    "crack",
+    "deformation",
+    "missing_part",
+    "ok",
+    "other",
+    "silicate_stain",
+    "water_stain"
+]
 
 from smbus2 import SMBus, i2c_msg
 import time
@@ -223,13 +223,14 @@ class TensorRTClassifier:
         return exp / np.sum(exp)
 
     def infer(self, frame: np.ndarray) -> tuple[int, float, float]:
+        infer_start = time.perf_counter()
+
         chw, crop_bgr = self.preprocess(frame)
         self.last_crop_bgr = crop_bgr
         if self.input_dtype == np.float16:
             chw = chw.astype(np.float16)
         np.copyto(self.host_in, chw.ravel())
 
-        infer_start = time.perf_counter()
         cuda.memcpy_htod_async(self.device_in, self.host_in, self.stream)
         if self.use_io_tensors:
             self.context.set_tensor_address(self.input_name, int(self.device_in))
