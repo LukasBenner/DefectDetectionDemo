@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -e 
 
-CONTAINER="multireaderdev" 
-IMAGE="scirocco2017/multireaderdevcontainer:1" 
+CONTAINER="detectiondemo" 
+IMAGE="captureapp:local" 
 
 if [ "$EUID" -ne 0 ]; then
   echo "This script has to be executed as root or with sudo"
